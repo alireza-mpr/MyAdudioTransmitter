@@ -3,29 +3,25 @@ using System.Collections.Generic;
 using System.IO;
 using NAudio.Wave;
 
-namespace Sender
+namespace FastSender
 {
     class Program
     {
         static void Main(string[] args)
         {
-            Console.WriteLine("Audio Sender");
+            Console.WriteLine("Fast Audio Sender");
 
-            string filePath = null;
-            double pilotSeconds = 5.0; // default
+            string filePath;
+            double pilotSeconds = 5.0;
+            int baud = 1000; // با ریسیور sync
 
             if (args.Length >= 1)
-            {
                 filePath = args[0];
-            }
             else
             {
                 Console.Write("Enter file path: ");
                 filePath = Console.ReadLine()?.Trim('"');
             }
-
-            if (args.Length >= 2 && double.TryParse(args[1], out var p) && p > 0.2)
-                pilotSeconds = p;
 
             if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
             {
@@ -33,43 +29,47 @@ namespace Sender
                 return;
             }
 
-            byte[] fileData = File.ReadAllBytes(filePath);
-            Console.WriteLine($"File: {filePath}, Size: {fileData.Length} bytes");
+            if (args.Length >= 2 && double.TryParse(args[1], out var p) && p >= 1.0)
+                pilotSeconds = p;
+            if (args.Length >= 3 && int.TryParse(args[2], out var b) && b > 100 && b <= 5000)
+                baud = b;
+
+            byte[] data = File.ReadAllBytes(filePath);
+            Console.WriteLine($"File: {filePath}, {data.Length} bytes");
 
             var cfg = new ModemConfig
             {
-                PilotSeconds = pilotSeconds
+                PilotSeconds = pilotSeconds,
+                Baud = baud
             };
 
-            var frames = FrameBuilder.BuildFrames(fileData, cfg);
+            var frames = FrameBuilder.BuildFrames(data, cfg);
             Console.WriteLine($"Frames (with repeats): {frames.Count}");
 
-            // frames → bits
             var bits = new List<int>();
-            foreach (var frame in frames)
+            foreach (var f in frames)
             {
                 bits.AddRange(ModemConfig.PreambleBits);
-                var fb = frame.ToBytes();
-                foreach (var b in fb)
-                {
+                var fb = f.ToBytes();
+                foreach (var bt in fb)
                     for (int i = 7; i >= 0; i--)
-                        bits.Add((b >> i) & 1);
-                }
+                        bits.Add((bt >> i) & 1);
             }
 
             Console.WriteLine($"Total bits: {bits.Count}");
 
             var pilot = FskModulator.GeneratePilot(cfg);
             var gap = FskModulator.GenerateSilence(0.2, cfg);
-            var data = FskModulator.GenerateData(bits, cfg);
+            var dataAudio = FskModulator.GenerateData(bits, cfg);
 
-            var full = new byte[pilot.Length + gap.Length + data.Length];
+            var full = new byte[pilot.Length + gap.Length + dataAudio.Length];
             Buffer.BlockCopy(pilot, 0, full, 0, pilot.Length);
             Buffer.BlockCopy(gap, 0, full, pilot.Length, gap.Length);
-            Buffer.BlockCopy(data, 0, full, pilot.Length + gap.Length, data.Length);
+            Buffer.BlockCopy(dataAudio, 0, full, pilot.Length + gap.Length, dataAudio.Length);
 
-            Console.WriteLine($"Pilot: {cfg.PilotSeconds} s @ {cfg.PilotFreq} Hz");
-            Console.WriteLine($"Approx duration: {full.Length / (double)(cfg.SampleRate * 2):F1} s");
+            double seconds = full.Length / (double)(cfg.SampleRate * 2);
+            Console.WriteLine($"Pilot: {cfg.PilotSeconds}s @ {cfg.PilotFreq} Hz");
+            Console.WriteLine($"Baud={cfg.Baud}, Audio length ≈ {seconds:F1}s");
 
             Play(full, cfg);
 
@@ -92,28 +92,28 @@ namespace Sender
 
     class ModemConfig
     {
-        public int SampleRate = 48000;  // ثابت برای تولید؛ OS بقیه را هندل می‌کند
+        public int SampleRate = 48000;
         public int BitsPerSample = 16;
         public int Channels = 1;
 
-        public int Baud = 400;          // 200bps (خیلی پایدار)
-        public double Freq0 = 1200.0;
-        public double Freq1 = 2200.0;
+        public int Baud = 1000;
+        public double Freq0 = 4000.0;
+        public double Freq1 = 8000.0;
 
         public double PilotFreq = 1000.0;
         public double PilotSeconds = 5.0;
 
-        public int FramePayloadSize = 64;
+        public int FramePayloadSize = 128;
         public int FrameRepeats = 2;
 
         public static readonly int[] PreambleBits;
 
         static ModemConfig()
         {
-            uint preamble = 0x55AA55AA;
+            uint pre = 0x55AA55AA;
             var bits = new List<int>();
             for (int i = 31; i >= 0; i--)
-                bits.Add((int)((preamble >> i) & 1));
+                bits.Add((int)((pre >> i) & 1));
             PreambleBits = bits.ToArray();
         }
 
@@ -157,8 +157,8 @@ namespace Sender
         public static List<Frame> BuildFrames(byte[] data, ModemConfig cfg)
         {
             var frames = new List<Frame>();
-            int index = 0;
             int offset = 0;
+            ushort index = 0;
 
             while (offset < data.Length)
             {
@@ -169,7 +169,7 @@ namespace Sender
                 var f = new Frame
                 {
                     Type = 0,
-                    Index = (ushort)index,
+                    Index = index,
                     Length = (ushort)len,
                     Payload = payload
                 };
@@ -184,7 +184,7 @@ namespace Sender
             var eof = new Frame
             {
                 Type = 1,
-                Index = (ushort)index,
+                Index = index,
                 Length = 0,
                 Payload = Array.Empty<byte>()
             };
@@ -210,15 +210,15 @@ namespace Sender
             return ShortsToBytes(samples);
         }
 
-        public static byte[] GenerateSilence(double seconds, ModemConfig cfg)
+        public static byte[] GenerateSilence(double sec, ModemConfig cfg)
         {
-            int totalSamples = (int)(cfg.SampleRate * seconds);
-            return new byte[totalSamples * 2]; // صفر
+            int totalSamples = (int)(cfg.SampleRate * sec);
+            return new byte[totalSamples * 2];
         }
 
         public static byte[] GenerateData(List<int> bits, ModemConfig cfg)
         {
-            int spb = cfg.SampleRate / cfg.Baud; // 48000/200=240
+            int spb = cfg.SampleRate / cfg.Baud; // 48000/1000 = 48
             var samples = new short[bits.Count * spb];
 
             double w0 = 2.0 * Math.PI * cfg.Freq0 / cfg.SampleRate;

@@ -3,13 +3,13 @@ using System.Collections.Generic;
 using System.IO;
 using NAudio.Wave;
 
-namespace Receiver
+namespace FastReceiver
 {
     class Program
     {
         static void Main(string[] args)
         {
-            Console.WriteLine("Audio Receiver");
+            Console.WriteLine("Fast Audio Receiver");
 
             string outputPath;
             if (args.Length >= 1)
@@ -24,13 +24,12 @@ namespace Receiver
 
             var cfg = new ModemConfig();
 
-            // فایل خروجی را از همان اول باز می‌کنیم؛ هر فریم معتبر به‌ترتیب روی آن نوشته می‌شود.
             using var fs = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.Read);
             var collector = new FrameCollector(cfg, fs);
 
             var waveIn = new WaveInEvent
             {
-                WaveFormat = new WaveFormat(48000, 16, 1) // فرمت ثابت؛ ویندوز/درایور resample می‌کند
+                WaveFormat = new WaveFormat(48000, 16, 1)
             };
 
             Console.WriteLine($"Capture format: {waveIn.WaveFormat.SampleRate} Hz, {waveIn.WaveFormat.Channels} ch, {waveIn.WaveFormat.BitsPerSample} bit");
@@ -38,14 +37,21 @@ namespace Receiver
             var demod = new FskDemodulator(cfg, waveIn.WaveFormat);
 
             bool capturing = true;
-
             DateTime lastActivity = DateTime.UtcNow;
+
             waveIn.DataAvailable += (s, e) =>
             {
+                // timeout بر اساس فریم سالم
+                if ((DateTime.UtcNow - lastActivity).TotalSeconds > cfg.TimeOutSec)
+                {
+                    try { waveIn.StopRecording(); } catch { }
+                    return;
+                }
+
                 var bits = demod.Process(e.Buffer, e.BytesRecorded);
 
                 if (!demod.Started)
-                    return; // تا زمان detection پایلوت، بیت‌ها را نادیده بگیر
+                    return;
 
                 foreach (var b in bits)
                     collector.FeedBit(b);
@@ -56,12 +62,6 @@ namespace Receiver
                     collector.ResetActivityFlag();
                 }
 
-                // اگر ۵ ثانیه هیچ دادهٔ معتبری نیامد، ضبط را قطع کن
-                if ((DateTime.UtcNow - lastActivity).TotalSeconds > cfg.TimeOutSec)
-                {
-                    try { waveIn.StopRecording(); } catch { }
-                }
-
                 if (collector.Completed)
                 {
                     try { waveIn.StopRecording(); } catch { }
@@ -70,7 +70,7 @@ namespace Receiver
 
             waveIn.RecordingStopped += (s, e) =>
             {
-                Console.WriteLine("Recording stopped.");
+                Console.WriteLine("\nRecording stopped.");
                 capturing = false;
             };
 
@@ -81,13 +81,9 @@ namespace Receiver
                 System.Threading.Thread.Sleep(200);
 
             if (!collector.SawEof)
-            {
                 Console.WriteLine("No EOF detected. Partial data (if any) is already in the output file.");
-            }
             else
-            {
                 Console.WriteLine("EOF received. File completed (as far as frames decoded correctly).");
-            }
 
             Console.WriteLine($"Output file: {outputPath}");
             Console.WriteLine("Press Enter to exit.");
@@ -97,25 +93,26 @@ namespace Receiver
 
     class ModemConfig
     {
-        public int TimeOutSec = 64;
-        public int Baud = 400;
-        public double Freq0 = 1200.0;
-        public double Freq1 = 2200.0;
+        public int TimeOutSec = 15;
+
+        public int Baud = 1000;
+        public double Freq0 = 4000.0;
+        public double Freq1 = 8000.0;
 
         public double PilotFreq = 1000.0;
         public double PilotLockSeconds = 1.0;
 
-        public int FramePayloadSize = 64;
+        public int FramePayloadSize = 128;
         public int FrameRepeats = 2;
 
         public static readonly int[] PreambleBits;
 
         static ModemConfig()
         {
-            uint preamble = 0x55AA55AA;
+            uint pre = 0x55AA55AA;
             var bits = new List<int>();
             for (int i = 31; i >= 0; i--)
-                bits.Add((int)((preamble >> i) & 1));
+                bits.Add((int)((pre >> i) & 1));
             PreambleBits = bits.ToArray();
         }
     }
@@ -141,7 +138,7 @@ namespace Receiver
             _cfg = cfg;
             _sampleRate = fmt.SampleRate;
             _bytesPerSample = (fmt.BitsPerSample / 8) * fmt.Channels;
-            _samplesPerBit = (double)_sampleRate / _cfg.Baud;
+            _samplesPerBit = (double)_sampleRate / _cfg.Baud; // 48
 
             _w0 = 2.0 * Math.PI * _cfg.Freq0 / _sampleRate;
             _w1 = 2.0 * Math.PI * _cfg.Freq1 / _sampleRate;
@@ -167,6 +164,8 @@ namespace Receiver
             }
 
             int win = (int)Math.Round(_samplesPerBit);
+            if (win < 8) win = 8;
+
             while (_buffer.Count >= win)
             {
                 int bit = DetectBit(_buffer, win);
@@ -174,13 +173,12 @@ namespace Receiver
                 _buffer.RemoveRange(0, win);
             }
 
-            Console.Write(".");
             return bitsOut;
         }
 
         private void DetectPilot()
         {
-            int window = (int)(_sampleRate * 0.25); // 0.25s
+            int window = (int)(_sampleRate * 0.25);
             if (_buffer.Count < window)
                 return;
 
@@ -203,9 +201,7 @@ namespace Receiver
             double pilotEnergy = s0 * s0 + s1 * s1 - coeff * s0 * s1;
             double avgEnergy = total / window;
 
-            bool strong =
-                avgEnergy > 1e3 &&
-                pilotEnergy > avgEnergy * 8;
+            bool strong = avgEnergy > 1e3 && pilotEnergy > avgEnergy * 8;
 
             if (strong)
                 _pilotLockedDuration += 0.25;
@@ -216,7 +212,7 @@ namespace Receiver
             {
                 Started = true;
                 Console.WriteLine($">>> Pilot detected (~{_pilotLockedDuration:F1}s). Start decoding.");
-                _buffer.Clear(); // pilot را دور می‌ریزم، از اینجا به بعد دیتا
+                _buffer.Clear();
             }
 
             if (!Started && _buffer.Count > _sampleRate * 10)
@@ -260,7 +256,8 @@ namespace Receiver
         private readonly List<int> _frameBits = new();
 
         private readonly FileStream _fs;
-        private ushort _nextIndex = 0;  // انتظار فریم بعدی
+        private ushort _nextIndex = 0;
+
         public bool SawEof { get; private set; }
         public bool Completed { get; private set; }
         public bool WroteData { get; private set; }
@@ -272,10 +269,7 @@ namespace Receiver
             _fs = fs;
         }
 
-        public void ResetActivityFlag()
-        {
-            WroteData = false;
-        }
+        public void ResetActivityFlag() => WroteData = false;
 
         public void FeedBit(int bit)
         {
@@ -295,7 +289,6 @@ namespace Receiver
                     {
                         if (b != _preamble[i++]) { match = false; break; }
                     }
-
                     if (match)
                     {
                         _inFrame = true;
@@ -306,9 +299,7 @@ namespace Receiver
             else
             {
                 _frameBits.Add(bit);
-
-                // حداقل برای هدر+CRC بدون payload: 1+2+2+4 = 9 بایت = 72 بیت
-                if (_frameBits.Count >= 72)
+                if (_frameBits.Count >= 72) // حداقل برای header+CRC
                     TryParseFrame();
             }
         }
@@ -329,9 +320,9 @@ namespace Receiver
             pos = 0;
             var body = new List<byte>();
 
-            body.Add(ReadByte(_frameBits, ref pos));                 // Type
-            body.AddRange(ReadBytes(_frameBits, ref pos, 2));        // Index
-            body.AddRange(ReadBytes(_frameBits, ref pos, 2));        // Len
+            body.Add(ReadByte(_frameBits, ref pos));          // Type
+            body.AddRange(ReadBytes(_frameBits, ref pos, 2)); // Index
+            body.AddRange(ReadBytes(_frameBits, ref pos, 2)); // Len
 
             var payload = ReadBytes(_frameBits, ref pos, len);
             body.AddRange(payload);
@@ -340,37 +331,28 @@ namespace Receiver
             uint recvCrc = (uint)(crcBytes[0] << 24 | crcBytes[1] << 16 | crcBytes[2] << 8 | crcBytes[3]);
             uint calc = Crc32.Compute(body.ToArray());
 
-            // آماده برای فریم بعد
             _inFrame = false;
             _frameBits.Clear();
             _preWin.Clear();
 
             if (recvCrc != calc)
-                return; // خراب، بنداز دور
+                return;
 
             if (type == 1)
             {
                 SawEof = true;
-                // اگر EOF با index برابر nextIndex بود، یعنی دقیقا بعد آخرین فریم پذیرفته شده آمده
                 Completed = true;
-                Console.WriteLine("EOF frame received.");
+                Console.WriteLine("\nEOF frame received.");
                 return;
             }
 
-            // فقط اگر فریم همونی‌ست که انتظار داریم، بنویس
             if (index == _nextIndex)
             {
                 _fs.Write(payload, 0, payload.Length);
-                _fs.Flush(true);
+                _fs.Flush();
                 Console.Write("w");
                 WroteData = true;
                 _nextIndex++;
-                // اگر فریم تکراری (به‌خاطر repeat) دوباره بیاد، چون index==nextIndex نیست، نادیده گرفته می‌شه.
-            }
-            else
-            {
-                // اگر index != _nextIndex، در این نسخه ساده نادیده می‌گیریم
-                // (می‌توانی برای دیباگ: Console.WriteLine($"Out-of-order frame {index}, expected {_nextIndex}");
             }
         }
 
