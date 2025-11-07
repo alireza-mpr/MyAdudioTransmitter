@@ -23,11 +23,14 @@ namespace Receiver
             }
 
             var cfg = new ModemConfig();
-            var collector = new FrameCollector(cfg);
+
+            // فایل خروجی را از همان اول باز می‌کنیم؛ هر فریم معتبر به‌ترتیب روی آن نوشته می‌شود.
+            using var fs = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.Read);
+            var collector = new FrameCollector(cfg, fs);
 
             var waveIn = new WaveInEvent
             {
-                WaveFormat = new WaveFormat(48000, 16, 1) // ثابت، OS resample می‌کنه
+                WaveFormat = new WaveFormat(48000, 16, 1) // فرمت ثابت؛ ویندوز/درایور resample می‌کند
             };
 
             Console.WriteLine($"Capture format: {waveIn.WaveFormat.SampleRate} Hz, {waveIn.WaveFormat.Channels} ch, {waveIn.WaveFormat.BitsPerSample} bit");
@@ -38,10 +41,11 @@ namespace Receiver
 
             waveIn.DataAvailable += (s, e) =>
             {
+                Console.Write(".");
                 var bits = demod.Process(e.Buffer, e.BytesRecorded);
 
                 if (!demod.Started)
-                    return; // تا قبل از pilot lock، بیت‌ها رو نادیده بگیر
+                    return; // تا زمان detection پایلوت، بیت‌ها را نادیده بگیر
 
                 foreach (var b in bits)
                     collector.FeedBit(b);
@@ -64,24 +68,16 @@ namespace Receiver
             while (capturing)
                 System.Threading.Thread.Sleep(200);
 
-            if (!collector.Completed)
+            if (!collector.SawEof)
             {
-                Console.WriteLine("No complete transfer detected.");
+                Console.WriteLine("No EOF detected. Partial data (if any) is already in the output file.");
             }
             else
             {
-                var data = collector.BuildFileData();
-                if (data == null)
-                {
-                    Console.WriteLine("Frames missing. Could not reconstruct file.");
-                }
-                else
-                {
-                    File.WriteAllBytes(outputPath, data);
-                    Console.WriteLine($"Saved: {outputPath}, {data.Length} bytes");
-                }
+                Console.WriteLine("EOF received. File completed (as far as frames decoded correctly).");
             }
 
+            Console.WriteLine($"Output file: {outputPath}");
             Console.WriteLine("Press Enter to exit.");
             Console.ReadLine();
         }
@@ -147,7 +143,7 @@ namespace Receiver
             for (int i = 0; i < sampleCount; i++)
             {
                 int idx = i * _bytesPerSample;
-                short s = (short)(buffer[idx] | (buffer[idx + 1] << 8)); // mono
+                short s = (short)(buffer[idx] | (buffer[idx + 1] << 8));
                 _buffer.Add(s);
             }
 
@@ -194,8 +190,8 @@ namespace Receiver
             double avgEnergy = total / window;
 
             bool strong =
-                avgEnergy > 1e3 &&           // سیگنال قابل توجه
-                pilotEnergy > avgEnergy * 8; // تمرکز انرژی روی pilot
+                avgEnergy > 1e3 &&
+                pilotEnergy > avgEnergy * 8;
 
             if (strong)
                 _pilotLockedDuration += 0.25;
@@ -206,7 +202,7 @@ namespace Receiver
             {
                 Started = true;
                 Console.WriteLine($">>> Pilot detected (~{_pilotLockedDuration:F1}s). Start decoding.");
-                _buffer.Clear(); // از اینجا به بعد، دیتا
+                _buffer.Clear(); // pilot را دور می‌ریزم، از اینجا به بعد دیتا
             }
 
             if (!Started && _buffer.Count > _sampleRate * 10)
@@ -249,17 +245,16 @@ namespace Receiver
         private bool _inFrame = false;
         private readonly List<int> _frameBits = new();
 
-        private readonly Dictionary<ushort, byte[]> _frames = new();
-        private ushort _maxIndex = 0;
-
-        public bool HasEof { get; private set; }
+        private readonly FileStream _fs;
+        private ushort _nextIndex = 0;  // انتظار فریم بعدی
+        public bool SawEof { get; private set; }
         public bool Completed { get; private set; }
 
-        public FrameCollector(ModemConfig cfg)
+        public FrameCollector(ModemConfig cfg, FileStream fs)
         {
-            // فعلاً cfg را لازم نداریم، ولی امضا با استفاده بالا هماهنگ می‌شود
             _preamble = ModemConfig.PreambleBits;
             _preambleLen = _preamble.Length;
+            _fs = fs;
         }
 
         public void FeedBit(int bit)
@@ -292,7 +287,7 @@ namespace Receiver
             {
                 _frameBits.Add(bit);
 
-                // حداقل هدر: Type(1) + Index(2) + Len(2) + CRC(4) = 9 بایت = 72 بیت
+                // حداقل برای هدر+CRC بدون payload: 1+2+2+4 = 9 بایت = 72 بیت
                 if (_frameBits.Count >= 72)
                     TryParseFrame();
             }
@@ -312,8 +307,8 @@ namespace Receiver
                 return;
 
             pos = 0;
-
             var body = new List<byte>();
+
             body.Add(ReadByte(_frameBits, ref pos));                 // Type
             body.AddRange(ReadBytes(_frameBits, ref pos, 2));        // Index
             body.AddRange(ReadBytes(_frameBits, ref pos, 2));        // Len
@@ -331,48 +326,31 @@ namespace Receiver
             _preWin.Clear();
 
             if (recvCrc != calc)
-                return; // فریم خراب، رها کن
+                return; // خراب، بنداز دور
 
             if (type == 1)
             {
-                HasEof = true;
-                if (index > _maxIndex) _maxIndex = index;
-                CheckComplete();
+                SawEof = true;
+                // اگر EOF با index برابر nextIndex بود، یعنی دقیقا بعد آخرین فریم پذیرفته شده آمده
+                Completed = true;
+                Console.WriteLine("EOF frame received.");
                 return;
             }
 
-            if (!_frames.ContainsKey(index))
+            // فقط اگر فریم همونی‌ست که انتظار داریم، بنویس
+            if (index == _nextIndex)
             {
-                _frames[index] = payload;
-                if (index > _maxIndex) _maxIndex = index;
+                _fs.Write(payload, 0, payload.Length);
+                _fs.Flush(true);
+                Console.Write("w");
+                _nextIndex++;
+                // اگر فریم تکراری (به‌خاطر repeat) دوباره بیاد، چون index==nextIndex نیست، نادیده گرفته می‌شه.
             }
-
-            CheckComplete();
-        }
-
-        private void CheckComplete()
-        {
-            if (!HasEof) return;
-            for (ushort i = 0; i < _maxIndex; i++)
+            else
             {
-                if (!_frames.ContainsKey(i))
-                    return;
+                // اگر index != _nextIndex، در این نسخه ساده نادیده می‌گیریم
+                // (می‌توانی برای دیباگ: Console.WriteLine($"Out-of-order frame {index}, expected {_nextIndex}");
             }
-            Completed = true;
-            Console.WriteLine("All frames received.");
-        }
-
-        public byte[] BuildFileData()
-        {
-            if (!Completed) return null;
-
-            using var ms = new MemoryStream();
-            for (ushort i = 0; i < _maxIndex; i++)
-            {
-                var p = _frames[i];
-                ms.Write(p, 0, p.Length);
-            }
-            return ms.ToArray();
         }
 
         private static byte ReadByte(List<int> bits, ref int pos)
