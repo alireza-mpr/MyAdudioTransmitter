@@ -103,7 +103,7 @@ namespace Sender
         public double PilotFreq = 1000.0;
         public double PilotSeconds = 5.0;
 
-        public int FramePayloadSize = 512;
+        public int FramePayloadSize = 64;
         public int FrameRepeats = 2;
 
         public static readonly int[] PreambleBits;

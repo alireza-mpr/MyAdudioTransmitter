@@ -41,7 +41,6 @@ namespace Receiver
 
             waveIn.DataAvailable += (s, e) =>
             {
-                Console.Write(".");
                 var bits = demod.Process(e.Buffer, e.BytesRecorded);
 
                 if (!demod.Started)
@@ -92,7 +91,7 @@ namespace Receiver
         public double PilotFreq = 1000.0;
         public double PilotLockSeconds = 1.0;
 
-        public int FramePayloadSize = 512;
+        public int FramePayloadSize = 64;
         public int FrameRepeats = 2;
 
         public static readonly int[] PreambleBits;
@@ -161,6 +160,7 @@ namespace Receiver
                 _buffer.RemoveRange(0, win);
             }
 
+            Console.Write(".");
             return bitsOut;
         }
 
