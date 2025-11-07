@@ -39,6 +39,7 @@ namespace Receiver
 
             bool capturing = true;
 
+            DateTime lastActivity = DateTime.UtcNow;
             waveIn.DataAvailable += (s, e) =>
             {
                 var bits = demod.Process(e.Buffer, e.BytesRecorded);
@@ -48,6 +49,18 @@ namespace Receiver
 
                 foreach (var b in bits)
                     collector.FeedBit(b);
+
+                if (collector.WroteData)
+                {
+                    lastActivity = DateTime.UtcNow;
+                    collector.ResetActivityFlag();
+                }
+
+                // اگر ۵ ثانیه هیچ دادهٔ معتبری نیامد، ضبط را قطع کن
+                if ((DateTime.UtcNow - lastActivity).TotalSeconds > cfg.TimeOutSec)
+                {
+                    try { waveIn.StopRecording(); } catch { }
+                }
 
                 if (collector.Completed)
                 {
@@ -84,7 +97,8 @@ namespace Receiver
 
     class ModemConfig
     {
-        public int Baud = 200;
+        public int TimeOutSec = 64;
+        public int Baud = 400;
         public double Freq0 = 1200.0;
         public double Freq1 = 2200.0;
 
@@ -249,12 +263,18 @@ namespace Receiver
         private ushort _nextIndex = 0;  // انتظار فریم بعدی
         public bool SawEof { get; private set; }
         public bool Completed { get; private set; }
+        public bool WroteData { get; private set; }
 
         public FrameCollector(ModemConfig cfg, FileStream fs)
         {
             _preamble = ModemConfig.PreambleBits;
             _preambleLen = _preamble.Length;
             _fs = fs;
+        }
+
+        public void ResetActivityFlag()
+        {
+            WroteData = false;
         }
 
         public void FeedBit(int bit)
@@ -343,6 +363,7 @@ namespace Receiver
                 _fs.Write(payload, 0, payload.Length);
                 _fs.Flush(true);
                 Console.Write("w");
+                WroteData = true;
                 _nextIndex++;
                 // اگر فریم تکراری (به‌خاطر repeat) دوباره بیاد، چون index==nextIndex نیست، نادیده گرفته می‌شه.
             }

@@ -96,7 +96,7 @@ namespace Sender
         public int BitsPerSample = 16;
         public int Channels = 1;
 
-        public int Baud = 200;          // 200bps (خیلی پایدار)
+        public int Baud = 400;          // 200bps (خیلی پایدار)
         public double Freq0 = 1200.0;
         public double Freq1 = 2200.0;
 
